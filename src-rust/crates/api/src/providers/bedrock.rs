@@ -31,6 +31,7 @@ use crate::provider_types::{
     StreamEvent, SystemPrompt, SystemPromptStyle,
 };
 
+use super::message_normalization::remove_empty_messages;
 use super::request_options::merge_bedrock_options;
 
 // ---------------------------------------------------------------------------
@@ -318,8 +319,7 @@ impl BedrockProvider {
     }
 
     fn build_converse_messages(request: &ProviderRequest) -> Vec<Value> {
-        request
-            .messages
+        remove_empty_messages(&request.messages)
             .iter()
             .map(|msg| {
                 let role = match msg.role {

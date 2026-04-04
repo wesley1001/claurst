@@ -195,7 +195,8 @@ pub fn qwen() -> OpenAiCompatProvider {
 
 /// Mistral AI — Reads `MISTRAL_API_KEY`.
 /// Uses OpenAI-compatible format with Mistral-specific quirks:
-///   - Tool call IDs must be alphanumeric only, zero-padded to exactly 9 chars.
+///   - Tool call IDs must be alphanumeric only, truncated to 9 chars and
+///     right-padded with zeroes to exactly 9 chars.
 ///   - An assistant "Done." turn is inserted between tool→user message transitions.
 pub fn mistral() -> OpenAiCompatProvider {
     let key = std::env::var("MISTRAL_API_KEY").unwrap_or_default();

@@ -10,6 +10,7 @@ use crate::provider_error::ProviderError;
 use crate::provider_types::{ProviderRequest, ProviderResponse, StopReason};
 use crate::transform::MessageTransformer;
 use crate::types::{ApiMessage, ApiToolDefinition};
+use crate::providers::message_normalization::normalize_anthropic_messages;
 use claurst_core::provider_id::ProviderId;
 use claurst_core::types::{ContentBlock, UsageInfo};
 
@@ -35,7 +36,9 @@ impl MessageTransformer for AnthropicTransformer {
         use serde_json::json;
 
         // Convert messages to API wire format.
-        let api_messages: Vec<ApiMessage> = request.messages.iter().map(ApiMessage::from).collect();
+        let normalized_messages = normalize_anthropic_messages(&request.messages);
+        let api_messages: Vec<ApiMessage> =
+            normalized_messages.iter().map(ApiMessage::from).collect();
         let messages_json = serde_json::to_value(&api_messages).map_err(|e| {
             ProviderError::Other {
                 provider: ProviderId::new(ProviderId::ANTHROPIC),

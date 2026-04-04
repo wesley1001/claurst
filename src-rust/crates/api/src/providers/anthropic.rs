@@ -24,6 +24,8 @@ use crate::provider_types::{
 use crate::streaming::{AnthropicStreamEvent, ContentDelta, NullStreamHandler};
 use crate::types::{ApiMessage, ApiToolDefinition, CreateMessageRequest};
 
+use super::message_normalization::normalize_anthropic_messages;
+
 // ---------------------------------------------------------------------------
 // AnthropicProvider
 // ---------------------------------------------------------------------------
@@ -56,8 +58,8 @@ impl AnthropicProvider {
 
     /// Build a [`CreateMessageRequest`] from a [`ProviderRequest`].
     fn build_request(request: &ProviderRequest) -> CreateMessageRequest {
-        let api_messages: Vec<ApiMessage> = request
-            .messages
+        let normalized_messages = normalize_anthropic_messages(&request.messages);
+        let api_messages: Vec<ApiMessage> = normalized_messages
             .iter()
             .map(ApiMessage::from)
             .collect();

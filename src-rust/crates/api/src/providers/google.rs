@@ -15,7 +15,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use bytes::Bytes;
 use claurst_core::provider_id::{ModelId, ProviderId};
-use claurst_core::types::{ContentBlock, Role, ToolResultContent, UsageInfo};
+use claurst_core::types::{ContentBlock, Message, MessageContent, Role, ToolResultContent, UsageInfo};
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tracing::{debug, warn};
@@ -74,6 +74,59 @@ impl GoogleProvider {
             "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
             self.base_url, model, self.api_key
         )
+    }
+
+    fn tool_use_id_for_name(name: &str, occurrence: usize) -> String {
+        let sanitized: String = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let base = if sanitized.is_empty() { "tool" } else { sanitized.as_str() };
+        if occurrence == 0 {
+            format!("call_{}", base)
+        } else {
+            format!("call_{}_{}", base, occurrence + 1)
+        }
+    }
+
+    fn tool_name_by_id(messages: &[Message]) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        for message in messages {
+            let MessageContent::Blocks(blocks) = &message.content else {
+                continue;
+            };
+            for block in blocks {
+                if let ContentBlock::ToolUse { id, name, .. } = block {
+                    map.insert(id.clone(), name.clone());
+                }
+            }
+        }
+        map
+    }
+
+    fn infer_tool_name_from_id(tool_use_id: &str) -> Option<String> {
+        let raw = tool_use_id.strip_prefix("call_")?;
+        let trimmed = if let Some((candidate, suffix)) = raw.rsplit_once('_') {
+            if !candidate.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+                candidate
+            } else {
+                raw
+            }
+        } else {
+            raw
+        };
+
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 
     /// Convert a single ContentBlock to a Gemini "part" Value.
@@ -161,7 +214,7 @@ impl GoogleProvider {
     }
 
     /// Convert a ToolResult block to a "functionResponse" part Value.
-    fn tool_result_to_part(tool_use_id: &str, content: &ToolResultContent) -> Value {
+    fn tool_result_to_part(tool_name: &str, content: &ToolResultContent) -> Value {
         let response_content = match content {
             ToolResultContent::Text(t) => json!({ "content": t }),
             ToolResultContent::Blocks(blocks) => {
@@ -182,7 +235,7 @@ impl GoogleProvider {
         };
         json!({
             "functionResponse": {
-                "name": tool_use_id,
+                "name": tool_name,
                 "response": response_content
             }
         })
@@ -278,6 +331,7 @@ impl GoogleProvider {
         // Google requires a flat list of content objects.
         // ToolResult blocks must become separate user-role messages.
         let mut contents: Vec<Value> = Vec::new();
+        let tool_name_by_id = Self::tool_name_by_id(&request.messages);
 
         for msg in &request.messages {
             let role = match msg.role {
@@ -287,10 +341,24 @@ impl GoogleProvider {
 
             let blocks = msg.content_blocks();
 
-            // Separate ToolResult blocks from the rest — each becomes its own
-            // user-role message with a functionResponse part.
             let mut regular_parts: Vec<Value> = Vec::new();
             let mut tool_result_parts: Vec<Value> = Vec::new();
+            let flush_regular_parts = |contents: &mut Vec<Value>, parts: &mut Vec<Value>| {
+                if !parts.is_empty() {
+                    contents.push(json!({
+                        "role": role,
+                        "parts": std::mem::take(parts)
+                    }));
+                }
+            };
+            let flush_tool_result_parts = |contents: &mut Vec<Value>, parts: &mut Vec<Value>| {
+                if !parts.is_empty() {
+                    contents.push(json!({
+                        "role": "user",
+                        "parts": std::mem::take(parts)
+                    }));
+                }
+            };
 
             for block in &blocks {
                 if let ContentBlock::ToolResult {
@@ -299,28 +367,21 @@ impl GoogleProvider {
                     ..
                 } = block
                 {
-                    tool_result_parts
-                        .push(Self::tool_result_to_part(tool_use_id, content));
+                    flush_regular_parts(&mut contents, &mut regular_parts);
+                    let tool_name = tool_name_by_id
+                        .get(tool_use_id)
+                        .cloned()
+                        .or_else(|| Self::infer_tool_name_from_id(tool_use_id))
+                        .unwrap_or_else(|| tool_use_id.clone());
+                    tool_result_parts.push(Self::tool_result_to_part(&tool_name, content));
                 } else if let Some(part) = Self::content_block_to_part(block) {
+                    flush_tool_result_parts(&mut contents, &mut tool_result_parts);
                     regular_parts.push(part);
                 }
             }
 
-            // Emit the regular content object (if any parts).
-            if !regular_parts.is_empty() {
-                contents.push(json!({
-                    "role": role,
-                    "parts": regular_parts
-                }));
-            }
-
-            // Emit tool results as a separate user message.
-            if !tool_result_parts.is_empty() {
-                contents.push(json!({
-                    "role": "user",
-                    "parts": tool_result_parts
-                }));
-            }
+            flush_regular_parts(&mut contents, &mut regular_parts);
+            flush_tool_result_parts(&mut contents, &mut tool_result_parts);
         }
 
         // ---- System instruction ----
@@ -459,6 +520,8 @@ impl GoogleProvider {
             .and_then(|p| p.as_array());
 
         let mut content_blocks: Vec<ContentBlock> = Vec::new();
+        let mut tool_name_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
 
         if let Some(parts) = parts {
             for part in parts {
@@ -473,7 +536,11 @@ impl GoogleProvider {
                         .unwrap_or("")
                         .to_string();
                     let args = fc.get("args").cloned().unwrap_or(json!({}));
-                    let id = format!("call_{}", &name);
+                    let occurrence = tool_name_counts
+                        .entry(name.clone())
+                        .and_modify(|count| *count += 1)
+                        .or_insert(0);
+                    let id = Self::tool_use_id_for_name(&name, *occurrence);
                     content_blocks.push(ContentBlock::ToolUse {
                         id,
                         name,
@@ -622,11 +689,13 @@ impl LlmProvider for GoogleProvider {
             let mut byte_stream = byte_stream;
             let text_block_index: usize = 0;
             let mut tool_block_index: usize = 1000;
-            let mut open_tool_calls: std::collections::HashMap<String, usize> =
+            let mut open_tool_calls: std::collections::HashMap<usize, (usize, String, String)> =
                 std::collections::HashMap::new();
             let mut emitted_message_start = false;
             let message_id = format!("gemini-{}", uuid_v4_simple());
             let mut line_buf = String::new();
+            let mut tool_name_counts: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
 
             while let Some(chunk_result) = byte_stream.next().await {
                 let chunk: Bytes = match chunk_result {
@@ -722,7 +791,7 @@ impl LlmProvider for GoogleProvider {
                                 .and_then(|p| p.as_array());
 
                             if let Some(parts) = parts {
-                                for part in parts {
+                                for (part_idx, part) in parts.iter().enumerate() {
                                     if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                         yield Ok(StreamEvent::TextDelta {
                                             index: text_block_index,
@@ -739,13 +808,17 @@ impl LlmProvider for GoogleProvider {
                                             .map(|a| a.to_string())
                                             .unwrap_or_else(|| "{}".to_string());
 
-                                        let idx = if let Some(&existing) = open_tool_calls.get(&name) {
-                                            existing
+                                        let idx = if let Some((existing_idx, _, _)) = open_tool_calls.get(&part_idx) {
+                                            *existing_idx
                                         } else {
+                                            let occurrence = tool_name_counts
+                                                .entry(name.clone())
+                                                .and_modify(|count| *count += 1)
+                                                .or_insert(0);
+                                            let id = Self::tool_use_id_for_name(&name, *occurrence);
                                             let idx = tool_block_index;
                                             tool_block_index += 1;
-                                            open_tool_calls.insert(name.clone(), idx);
-                                            let id = format!("call_{}", &name);
+                                            open_tool_calls.insert(part_idx, (idx, id.clone(), name.clone()));
                                             yield Ok(StreamEvent::ContentBlockStart {
                                                 index: idx,
                                                 content_block: ContentBlock::ToolUse {
@@ -781,7 +854,10 @@ impl LlmProvider for GoogleProvider {
 
                                 // Close tool call blocks.
                                 let mut tool_indices: Vec<usize> =
-                                    open_tool_calls.values().cloned().collect();
+                                    open_tool_calls
+                                        .values()
+                                        .map(|(idx, _, _)| *idx)
+                                        .collect();
                                 tool_indices.sort_unstable();
                                 for idx in tool_indices {
                                     yield Ok(StreamEvent::ContentBlockStop { index: idx });
@@ -960,4 +1036,108 @@ fn uuid_v4_simple() -> String {
     let a = t ^ (t >> 17) ^ (t << 13);
     let b = a.wrapping_mul(0x517cc1b727220a95);
     format!("{:032x}", b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use claurst_core::types::Message;
+    use serde_json::json;
+
+    fn test_request(messages: Vec<Message>) -> ProviderRequest {
+        ProviderRequest {
+            model: "gemini-3-flash-preview".to_string(),
+            messages,
+            system_prompt: None,
+            tools: vec![],
+            max_tokens: 512,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: vec![],
+            thinking: None,
+            provider_options: json!({}),
+        }
+    }
+
+    #[test]
+    fn build_request_body_uses_function_names_for_tool_results() {
+        let provider = GoogleProvider::new("test".to_string());
+        let request = test_request(vec![
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call_search_2".to_string(),
+                name: "search".to_string(),
+                input: json!({"q": "cats"}),
+            }]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_search_2".to_string(),
+                content: ToolResultContent::Text("ok".to_string()),
+                is_error: Some(false),
+            }]),
+        ]);
+
+        let body = provider.build_request_body(&request);
+        let contents = body["contents"].as_array().expect("contents array");
+        assert_eq!(contents.len(), 2);
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["name"],
+            json!("search")
+        );
+    }
+
+    #[test]
+    fn build_request_body_preserves_tool_result_order() {
+        let provider = GoogleProvider::new("test".to_string());
+        let request = test_request(vec![Message::user_blocks(vec![
+            ContentBlock::Text {
+                text: "before".to_string(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "call_search".to_string(),
+                content: ToolResultContent::Text("done".to_string()),
+                is_error: Some(false),
+            },
+            ContentBlock::Text {
+                text: "after".to_string(),
+            },
+        ])]);
+
+        let body = provider.build_request_body(&request);
+        let contents = body["contents"].as_array().expect("contents array");
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[0]["role"], json!("user"));
+        assert_eq!(contents[0]["parts"][0]["text"], json!("before"));
+        assert_eq!(contents[1]["parts"][0]["functionResponse"]["name"], json!("search"));
+        assert_eq!(contents[2]["parts"][0]["text"], json!("after"));
+    }
+
+    #[test]
+    fn parse_response_body_assigns_unique_ids_for_duplicate_tool_names() {
+        let provider = GoogleProvider::new("test".to_string());
+        let response = json!({
+            "candidates": [{
+                "finishReason": "FUNCTION_CALL",
+                "content": {
+                    "parts": [
+                        { "functionCall": { "name": "search", "args": { "q": "a" } } },
+                        { "functionCall": { "name": "search", "args": { "q": "b" } } }
+                    ]
+                }
+            }],
+            "usageMetadata": {}
+        });
+
+        let parsed = provider
+            .parse_response_body(&response, "gemini-3-flash-preview")
+            .expect("parsed response");
+
+        assert!(matches!(
+            &parsed.content[0],
+            ContentBlock::ToolUse { id, .. } if id == "call_search"
+        ));
+        assert!(matches!(
+            &parsed.content[1],
+            ContentBlock::ToolUse { id, .. } if id == "call_search_2"
+        ));
+    }
 }

@@ -141,10 +141,8 @@ impl OpenAiCompatProvider {
             s = s.chars().filter(|c| c.is_alphanumeric()).collect();
         }
         if let Some(max_len) = self.quirks.tool_id_max_len {
-            // Truncate to at most max_len characters, then zero-pad on the left
-            // to exactly max_len so the ID always has a fixed, valid length.
-            let truncated = &s[..s.len().min(max_len)];
-            s = format!("{:0>width$}", truncated, width = max_len);
+            let truncated: String = s.chars().take(max_len).collect();
+            s = format!("{:0<width$}", truncated, width = max_len);
         }
         s
     }
@@ -755,5 +753,38 @@ impl LlmProvider for OpenAiCompatProvider {
             structured_output: true,
             system_prompt_style: SystemPromptStyle::SystemMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mistral_tool_ids_match_opencode_style() {
+        let provider = OpenAiCompatProvider::new("mistral", "Mistral", "https://example.com")
+            .with_quirks(ProviderQuirks {
+                tool_id_max_len: Some(9),
+                tool_id_alphanumeric_only: true,
+                ..Default::default()
+            });
+
+        assert_eq!(provider.scrub_tool_id("call-123456789abc"), "call12345");
+        assert_eq!(provider.scrub_tool_id("x"), "x00000000");
+    }
+
+    #[test]
+    fn fix_tool_user_sequence_inserts_done_between_tool_and_user() {
+        let mut messages = vec![
+            json!({"role": "tool", "tool_call_id": "call_1", "content": "ok"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        OpenAiCompatProvider::apply_fix_tool_user_sequence(&mut messages);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], json!("assistant"));
+        assert_eq!(messages[1]["content"], json!("Done."));
     }
 }
